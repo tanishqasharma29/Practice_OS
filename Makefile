@@ -2,7 +2,7 @@ CC      ?= gcc
 CFLAGS  := -m32 -std=gnu11 -ffreestanding -fno-pie -fno-stack-protector -fno-tree-loop-distribute-patterns -fno-asynchronous-unwind-tables \
            -O2 -Wall -Wextra -Werror -nostdlib -Isrc
 LDFLAGS := -m32 -T linker.ld -nostdlib -no-pie -Wl,--build-id=none -Wl,-z,noexecstack
-OBJS    := build/boot.o build/kernel.o build/lib.o build/pmm.o build/paging.o build/kheap.o build/task.o build/demo_tasks.o build/selftest.o
+OBJS    := build/boot.o build/kernel.o build/lib.o build/pmm.o build/paging.o build/kheap.o build/task.o build/demo_tasks.o build/selftest.o build/syscall.o build/user.o
 
 all: build/kernel.elf
 
@@ -29,4 +29,3 @@ test-qemu: build/kernel.elf
 clean:
 	rm -rf build
 .PHONY: all run test-host test-qemu clean
-
