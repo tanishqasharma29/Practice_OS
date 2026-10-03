@@ -77,9 +77,10 @@ ISR_NOERR \n
 
 isr_common:
     pusha
+    cld
     push %esp
-    call isr_handler
-    add $4, %esp
+    call isr_handler       /* returns the stack pointer to resume (changes on a task switch) */
+    mov %eax, %esp
     popa
     add $8, %esp
     iret
@@ -91,3 +92,4 @@ isr_stub_table:
 .long isr\n
 .endr
 .section .note.GNU-stack,"",@progbits
+

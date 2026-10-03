@@ -19,7 +19,15 @@ void screen_clear(void);
 static inline void outb(uint16_t p, uint8_t v) { __asm__ volatile("outb %0,%1" :: "a"(v), "Nd"(p)); }
 static inline uint8_t inb(uint16_t p) { uint8_t v; __asm__ volatile("inb %1,%0" : "=a"(v) : "Nd"(p)); return v; }
 
+static inline uint32_t irq_save(void) {
+    uint32_t f; __asm__ volatile("pushf; pop %0; cli" : "=r"(f) :: "memory"); return f;
+}
+static inline void irq_restore(uint32_t f) {
+    __asm__ volatile("push %0; popf" :: "r"(f) : "memory", "cc");
+}
+
 uint32_t timer_ticks(void);
 void qemu_exit(uint8_t code);      /* isa-debug-exit; no-op on real hardware */
 int  run_selftest(void);           /* returns number of failed checks */
 #endif
+

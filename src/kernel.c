@@ -1,8 +1,10 @@
-/* StrataOS - small educational 32-bit x86 kernel. Phase 1: memory management. */
+/* StrataOS - small educational 32-bit x86 kernel. Phases 1-2: memory management, multitasking. */
 #include "kernel.h"
 #include "pmm.h"
 #include "paging.h"
 #include "kheap.h"
+#include "task.h"
+#include "demo_tasks.h"
 
 /* ---------- console: VGA text + COM1 serial ---------- */
 #define COM1 0x3F8
@@ -27,12 +29,14 @@ void screen_clear(void) {
     cx = cy = 0;
 }
 void putc(char c) {
+    uint32_t irqf = irq_save();               /* console state is shared by all tasks */
     if (c == '\n') serial_putc('\r');
     serial_putc(c);
     if (c == '\n') { cx = 0; cy++; }
     else if (c == '\b') { if (cx > 0) { cx--; vga[cy * 80 + cx] = 0x0F20; } }
     else { vga[cy * 80 + cx] = 0x0F00 | (uint8_t)c; if (++cx == 80) { cx = 0; cy++; } }
     if (cy >= 25) vga_scroll();
+    irq_restore(irqf);
 }
 void puts(const char *s) { while (*s) putc(*s++); }
 void put_dec(uint32_t v) {
@@ -109,7 +113,7 @@ static void panic_exit(const char *msg, struct regs *r, uint8_t code) {
     for (;;) __asm__ volatile("cli; hlt");
 }
 
-void isr_handler(struct regs *r) {
+uint32_t isr_handler(struct regs *r) {
     if (r->int_no == 14) {
         uint32_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
         puts("\n*** PAGE FAULT accessing "); put_hex(cr2);
@@ -118,9 +122,12 @@ void isr_handler(struct regs *r) {
         for (;;) __asm__ volatile("cli; hlt");
     }
     if (r->int_no < 32) panic_exit("CPU EXCEPTION", r, 0x12);
+    uint32_t resume = (uint32_t)r;
     if (r->int_no == 32) ticks++;
     else if (r->int_no == 33) kbd_irq();
     outb(0x20, 0x20);                                       /* EOI (only IRQs 0-1 are unmasked) */
+    if (r->int_no == 32) resume = schedule(resume);         /* preemptive round-robin switch */
+    return resume;                                          /* isr_common resumes on this stack */
 }
 
 /* ---------- multiboot ---------- */
@@ -208,6 +215,19 @@ static void cmd_meminfo(void) {
     put_dec(paging_tables_used()); puts(" page tables\n");
 }
 
+static void cmd_tasks(void) {
+    struct task_info ti[MAX_TASKS];
+    int n = task_list(ti, MAX_TASKS);
+    puts("ID  STATE     SWITCHES  NAME\n");
+    for (int i = 0; i < n; i++) {
+        const char *st = ti[i].is_current ? "running" : ti[i].state == TASK_READY ? "ready" :
+                         ti[i].state == TASK_SLEEPING ? "sleeping" : "dead";
+        put_dec(ti[i].id); puts("   "); puts(st);
+        for (int k = (int)strlen(st); k < 10; k++) putc(' ');
+        put_dec(ti[i].switches); puts("         "); puts(ti[i].name); putc('\n');
+    }
+}
+
 static void run(char *line) {
     char *argv[4]; int argc = 0;
     for (char *p = line; *p && argc < 4; ) {
@@ -224,6 +244,9 @@ static void run(char *line) {
              "malloc N | free ID     kmalloc N bytes / kfree handle ID\n"
              "heapcheck              verify heap block chain\n"
              "translate ADDR         virtual -> physical (decimal or 0x hex)\n"
+             "tasks                 list kernel threads and how often each was scheduled\n"
+             "spawn blink | count N | churn N   start a demo thread\n"
+             "kill ID                stop a thread\n"
              "crash                  touch an unmapped page (expect PAGE FAULT)\n"
              "halt                   stop the machine\n");
     } else if (streq(c, "meminfo")) cmd_meminfo();
@@ -231,12 +254,12 @@ static void run(char *line) {
     else if (streq(c, "selftest")) run_selftest();
     else if (streq(c, "frame")) {
         if (nframes >= 16) { puts("frame list full\n"); return; }
-        uint32_t f = pmm_alloc_frame();
+        uint32_t irqf = irq_save(), f = pmm_alloc_frame(); irq_restore(irqf);
         if (!f) { puts("out of physical memory\n"); return; }
         frames[nframes++] = f; puts("frame "); put_hex(f); puts("\n");
     } else if (streq(c, "unframe")) {
         if (!nframes) { puts("no frames held\n"); return; }
-        uint32_t f = frames[--nframes]; pmm_free_frame(f); puts("freed "); put_hex(f); puts("\n");
+        uint32_t f = frames[--nframes], irqf = irq_save(); pmm_free_frame(f); irq_restore(irqf); puts("freed "); put_hex(f); puts("\n");
     } else if (streq(c, "malloc") && argc > 1 && parse_num(argv[1], &v) == 0) {
         for (int i = 0; i < MAX_HANDLES; i++) if (!handles[i]) {
             void *p = kmalloc(v);
@@ -252,6 +275,17 @@ static void run(char *line) {
         uint32_t ph;
         if (paging_translate(v, &ph) == 0) { put_hex(v); puts(" -> "); put_hex(ph); puts("\n"); }
         else { put_hex(v); puts(" not mapped\n"); }
+    } else if (streq(c, "tasks")) cmd_tasks();
+    else if (streq(c, "spawn") && argc > 1) {
+        int id = -1;
+        if (streq(argv[1], "blink")) id = task_create("blink", demo_blink, 0);
+        else if (streq(argv[1], "count") && argc > 2 && parse_num(argv[2], &v) == 0) id = task_create("count", demo_count, (void *)(uintptr_t)v);
+        else if (streq(argv[1], "churn") && argc > 2 && parse_num(argv[2], &v) == 0) id = task_create("churn", demo_churn, (void *)(uintptr_t)v);
+        else { puts("usage: spawn blink | count N | churn N\n"); return; }
+        if (id < 0) puts("could not create task (table full or out of memory)\n");
+        else { puts("started task "); put_dec((uint32_t)id); puts("\n"); }
+    } else if (streq(c, "kill") && argc > 1 && parse_num(argv[1], &v) == 0) {
+        puts(task_kill(v) == 0 ? "killed\n" : "no such running task (task 1 and the shell cannot be killed)\n");
     } else if (streq(c, "crash")) { *(volatile uint32_t *)0xE0000000u = 1; }
     else if (streq(c, "halt")) { puts("halting\n"); qemu_exit(0x10); for (;;) __asm__ volatile("cli; hlt"); }
     else puts("unknown or malformed command (try: help)\n");
@@ -268,8 +302,11 @@ void kernel_main(uint32_t magic, struct mb_info *mbi) {
     puts("[ok] Physical memory manager: "); put_dec(pmm_free_frames()); puts(" free frames\n");
     puts("[ok] Paging enabled, identity map to "); put_dec(pmm_max_usable_addr() / (1024 * 1024)); puts(" MB\n");
     puts("[ok] Kernel heap at "); put_hex(HEAP_VIRT); puts("\n");
+    kheap_set_lock(irq_save, irq_restore);                  /* heap becomes safe against preemption */
+    tasking_init(); puts("[ok] Preemptive multitasking (round-robin, 100 Hz)\n");
     __asm__ volatile("sti");
     puts("Type 'help' for commands.\n\n");
     char line[64];
-    for (;;) { puts("StrataOS> "); readline(line, sizeof line); run(line); }
+    for (;;) { task_reap(); puts("StrataOS> "); readline(line, sizeof line); run(line); }
 }
+

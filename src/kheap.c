@@ -19,6 +19,11 @@ static block_t *head, *tail;
 static uint8_t *heap_base;
 static size_t   heap_size, heap_max;
 static kheap_grow_fn grow_fn;
+static kheap_lock_fn lock_fn;
+static kheap_unlock_fn unlock_fn;
+static uint32_t lock(void) { return lock_fn ? lock_fn() : 0; }
+static void unlock(uint32_t s) { if (unlock_fn) unlock_fn(s); }
+void kheap_set_lock(kheap_lock_fn l, kheap_unlock_fn u) { lock_fn = l; unlock_fn = u; }
 
 static size_t round_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
@@ -61,7 +66,7 @@ static void *take(block_t *b, size_t size) {
     return (uint8_t *)b + HDR;
 }
 
-void *kmalloc(size_t size) {
+static void *kmalloc_locked(size_t size) {
     if (size == 0 || size > heap_max) return NULL;
     size = round_up(size, ALIGN);
     for (int attempt = 0; attempt < 2; attempt++) {
@@ -72,7 +77,7 @@ void *kmalloc(size_t size) {
     return NULL;
 }
 
-int kfree(void *ptr) {
+static int kfree_locked(void *ptr) {
     if (!ptr) return 0;
     uint8_t *p = ptr;
     if (p < heap_base + HDR || p >= heap_base + heap_size || ((uintptr_t)p % ALIGN)) return -1;
@@ -94,7 +99,7 @@ int kfree(void *ptr) {
     return 0;
 }
 
-int kheap_check(void) {
+static int kheap_check_locked(void) {
     size_t total = 0; block_t *prev = NULL;
     for (block_t *b = head; b; prev = b, b = b->next) {
         if ((uint8_t *)b != heap_base + total) return -1;     /* contiguity */
@@ -108,7 +113,7 @@ int kheap_check(void) {
     return 0;
 }
 
-void kheap_get_stats(struct kheap_stats *s) {
+static void stats_locked(struct kheap_stats *s) {
     s->total = heap_size; s->used_bytes = s->free_bytes = s->largest_free = 0;
     s->blocks = s->free_blocks = 0;
     for (block_t *b = head; b; b = b->next) {
@@ -119,3 +124,9 @@ void kheap_get_stats(struct kheap_stats *s) {
         } else s->used_bytes += b->size;
     }
 }
+
+
+void *kmalloc(size_t size) { uint32_t f = lock(); void *r = kmalloc_locked(size); unlock(f); return r; }
+int kfree(void *ptr) { uint32_t f = lock(); int r = kfree_locked(ptr); unlock(f); return r; }
+int kheap_check(void) { uint32_t f = lock(); int r = kheap_check_locked(); unlock(f); return r; }
+void kheap_get_stats(struct kheap_stats *s) { uint32_t f = lock(); stats_locked(s); unlock(f); }
