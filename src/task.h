@@ -21,6 +21,12 @@ int      task_reap(void);                                       /* free stacks o
 int      task_count(void);                                      /* live (non-unused, non-dead) tasks */
 int      task_list(struct task_info *out, int max);
 uint32_t task_current_id(void);
+int      task_create_user(uint32_t mode);
+int      task_is_user(void);
+void     task_mark_dead(void); /* interrupt context only */
+void     task_block(uint32_t ticks); /* interrupt context only */
+int      task_user_range(uint32_t ptr, uint32_t len, int write);
+uint32_t task_user_alloc(uint32_t bytes);
 int      task_stack_ok(void);                                   /* 1 if no stack canary is damaged */
 
 /* Called from the timer interrupt with the interrupted context's stack pointer;
