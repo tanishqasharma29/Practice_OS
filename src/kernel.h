@@ -26,8 +26,8 @@ static inline void irq_restore(uint32_t f) {
     __asm__ volatile("push %0; popf" :: "r"(f) : "memory", "cc");
 }
 
+void tss_set_stack(uint32_t esp);
 uint32_t timer_ticks(void);
 void qemu_exit(uint8_t code);      /* isa-debug-exit; no-op on real hardware */
 int  run_selftest(void);           /* returns number of failed checks */
 #endif
-
