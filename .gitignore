@@ -2,3 +2,6 @@ build/
 *.o
 *.elf
 *.ppm
+
+disk.img
+*.img
