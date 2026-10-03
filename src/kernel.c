@@ -1,4 +1,4 @@
-/* StrataOS - small educational 32-bit x86 kernel. Phases 1-3: memory, multitasking, user mode. */
+/* StrataOS - small educational 32-bit x86 kernel. Phases 1-4: memory, multitasking, user mode, disk and filesystem. */
 #include "kernel.h"
 #include "pmm.h"
 #include "paging.h"
@@ -7,6 +7,8 @@
 #include "demo_tasks.h"
 #include "interrupt.h"
 #include "syscall.h"
+#include "ata.h"
+#include "fs.h"
 
 /* ---------- console: VGA text + COM1 serial ---------- */
 #define COM1 0x3F8
@@ -251,7 +253,101 @@ static void cmd_tasks(void) {
     }
 }
 
+
+/* ---------- disk and filesystem shell commands ---------- */
+static const struct fs_dev disk_dev = { ata_read_sector, ata_write_sector, 0 };
+static struct fs_dev disk_dev_live;
+
+static void fs_err(int e) { puts("error: "); puts(fs_strerror(e)); putc('\n'); }
+
+static void mount_disk(void) {
+    int r = ata_init();
+    if (r != ATA_OK) { puts("[--] No ATA disk attached (filesystem commands unavailable)\n"); return; }
+    puts("[ok] ATA disk: "); puts(ata_model()); puts(", "); put_dec(ata_sector_count()); puts(" sectors\n");
+    disk_dev_live = disk_dev; disk_dev_live.sectors = ata_sector_count();
+    r = fs_mount(&disk_dev_live);
+    if (r == FS_OK) puts("[ok] StrataFS mounted\n");
+    else if (r == FS_ENOFS) puts("[--] Disk has no StrataFS; nothing was written. Use 'format yes' to create one (erases the directory table).\n");
+    else { puts("[!!] StrataFS not mounted: "); puts(fs_strerror(r)); puts(". Disk left untouched.\n"); }
+}
+
+static void ls_cb(void *ctx, const char *name, int is_dir, uint32_t size) {
+    (void)ctx;
+    puts(is_dir ? "d " : "- "); puts(name);
+    if (is_dir) puts("/"); else { puts("  "); put_dec(size); puts(" bytes"); }
+    putc('\n');
+}
+
+static char rawline[128];
+/* Text after the n-th space-separated word of the original line (n = 1 skips the command). */
+static const char *rest_after(int n) {
+    const char *p = rawline;
+    for (int i = 0; i < n; i++) { while (*p == ' ') p++; while (*p && *p != ' ') p++; }
+    if (*p == ' ') p++;
+    return p;
+}
+static uint8_t pattern_byte(uint32_t i) { return (uint8_t)('A' + (i * 7 + i / 26) % 26); }
+
+static void fs_command(const char *c, int argc, char **argv) {
+    uint32_t v;
+    if (streq(c, "diskinfo")) {
+        if (!ata_present()) puts("no ATA disk\n");
+        else { puts("model: "); puts(ata_model()); puts("\nsectors: "); put_dec(ata_sector_count());
+               puts(" ("); put_dec(ata_sector_count() / 2048); puts(" MiB)\n"); }
+        return;
+    }
+    if (streq(c, "format")) {
+        if (!ata_present()) { puts("no ATA disk\n"); return; }
+        if (argc < 2 || !streq(argv[1], "yes")) { puts("this erases the file table on the disk. Run: format yes\n"); return; }
+        int r = fs_format(&disk_dev_live);
+        if (r) fs_err(r); else puts("formatted StrataFS\n");
+        return;
+    }
+    if (!fs_is_mounted()) { puts(ata_present() ? "no filesystem mounted (try: format yes)\n" : "no ATA disk\n"); return; }
+    int r = 0;
+    if (streq(c, "ls")) r = fs_list(argc > 1 ? argv[1] : 0, ls_cb, 0);
+    else if (streq(c, "pwd")) { char b[160]; r = fs_getcwd(b, sizeof b); if (!r) { puts(b); putc('\n'); } }
+    else if (streq(c, "cd")) r = fs_chdir(argc > 1 ? argv[1] : "/");
+    else if (streq(c, "mkdir") && argc > 1) { r = fs_mkdir(argv[1]); if (!r) puts("created\n"); }
+    else if (streq(c, "rm") && argc > 1) { r = fs_remove(argv[1]); if (!r) puts("removed\n"); }
+    else if (streq(c, "cat") && argc > 1) {
+        struct fs_stat st; r = fs_stat(argv[1], &st);
+        if (!r && st.is_dir) r = FS_EISDIR;
+        if (!r) {
+            char *b = kmalloc(st.size + 1);
+            if (!b) { puts("out of memory\n"); return; }
+            uint32_t n = 0; r = fs_read(argv[1], b, st.size, &n);
+            if (!r) { for (uint32_t i = 0; i < n; i++) putc(b[i] == '\n' || (b[i] >= 32 && b[i] < 127) ? b[i] : '?'); if (!n || b[n - 1] != '\n') putc('\n'); }
+            kfree(b);
+        }
+    } else if (streq(c, "write") && argc > 1) {
+        const char *t = rest_after(2); uint32_t n = (uint32_t)strlen(t);
+        r = fs_write(argv[1], t, n); if (!r) { puts("wrote "); put_dec(n); puts(" bytes\n"); }
+    } else if ((streq(c, "mkfile") || streq(c, "verify")) && argc > 2 && parse_num(argv[2], &v) == 0) {
+        if (v > FS_MAX_FILE) { fs_err(FS_ETOOBIG); return; }
+        char *b = kmalloc(v + 1);
+        if (!b) { puts("out of memory\n"); return; }
+        if (streq(c, "mkfile")) {
+            for (uint32_t i = 0; i < v; i++) b[i] = (char)pattern_byte(i);
+            r = fs_write(argv[1], b, v); if (!r) { puts("wrote "); put_dec(v); puts(" bytes\n"); }
+        } else {
+            uint32_t n = 0; r = fs_read(argv[1], b, v, &n);
+            if (!r) {
+                int ok = (n == v);
+                for (uint32_t i = 0; ok && i < n; i++) if ((uint8_t)b[i] != pattern_byte(i)) ok = 0;
+                puts(ok ? "verify OK\n" : "verify MISMATCH\n");
+            }
+        }
+        kfree(b);
+    } else if (streq(c, "fsinfo")) {
+        uint32_t f, d, fr, tot; fs_usage(&f, &d, &fr, &tot);
+        put_dec(f); puts(" files, "); put_dec(d); puts(" dirs, "); put_dec(fr); puts(" / "); put_dec(tot); puts(" data sectors free\n");
+    } else { puts("usage error (try: help)\n"); return; }
+    if (r) fs_err(r);
+}
+
 static void run(char *line) {
+    { int k = 0; while (line[k] && k < (int)sizeof rawline - 1) { rawline[k] = line[k]; k++; } rawline[k] = 0; }
     char *argv[4]; int argc = 0;
     for (char *p = line; *p && argc < 4; ) {
         while (*p == ' ') *p++ = 0;
@@ -271,6 +367,9 @@ static void run(char *line) {
              "tasks                 list tasks and how often each was scheduled\n"
              "spawn blink | count N | churn N   start a demo thread\n"
              "kill ID                stop a thread\n"
+             "diskinfo | format yes  ATA disk details / create StrataFS (erases the file table)\n"
+             "ls [PATH] | cat F | write F TEXT | rm P | mkdir D | cd D | pwd | fsinfo\n"
+             "mkfile F N | verify F N   write / check N bytes of test data\n"
              "crash                  touch an unmapped page (expect PAGE FAULT)\n"
              "halt                   stop the machine\n");
     } else if (streq(c, "meminfo")) cmd_meminfo();
@@ -320,6 +419,9 @@ static void run(char *line) {
         puts(task_kill(v) == 0 ? "killed\n" : "no such running task (task 1 and the shell cannot be killed)\n");
     } else if (streq(c, "crash")) { *(volatile uint32_t *)0xE0000000u = 1; }
     else if (streq(c, "halt")) { puts("halting\n"); qemu_exit(0x10); for (;;) __asm__ volatile("cli; hlt"); }
+    else if (streq(c, "diskinfo") || streq(c, "format") || streq(c, "ls") || streq(c, "pwd") || streq(c, "cd") || streq(c, "mkdir") ||
+             streq(c, "rm") || streq(c, "cat") || streq(c, "write") || streq(c, "mkfile") || streq(c, "verify") || streq(c, "fsinfo"))
+        fs_command(c, argc, argv);
     else puts("unknown or malformed command (try: help)\n");
 }
 
@@ -337,8 +439,9 @@ void kernel_main(uint32_t magic, struct mb_info *mbi) {
     kheap_set_lock(irq_save, irq_restore);                  /* heap becomes safe against preemption */
     tasking_init(); puts("[ok] Preemptive multitasking (round-robin, 100 Hz)\n");
     puts("[ok] Ring 3 + TSS + int 0x80 (supervisor-only kernel pages)\n");
+    mount_disk();
     __asm__ volatile("sti");
     puts("Type 'help' for commands.\n\n");
-    char line[64];
+    char line[128];
     for (;;) { task_reap(); puts("StrataOS> "); readline(line, sizeof line); run(line); }
 }
