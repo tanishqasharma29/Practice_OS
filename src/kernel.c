@@ -1,10 +1,12 @@
-/* StrataOS - small educational 32-bit x86 kernel. Phases 1-2: memory management, multitasking. */
+/* StrataOS - small educational 32-bit x86 kernel. Phases 1-3: memory, multitasking, user mode. */
 #include "kernel.h"
 #include "pmm.h"
 #include "paging.h"
 #include "kheap.h"
 #include "task.h"
 #include "demo_tasks.h"
+#include "interrupt.h"
+#include "syscall.h"
 
 /* ---------- console: VGA text + COM1 serial ---------- */
 #define COM1 0x3F8
@@ -53,22 +55,34 @@ void qemu_exit(uint8_t code) { outb(0xF4, code); }
 /* ---------- GDT ---------- */
 struct gdt_entry { uint16_t lim, base_lo; uint8_t base_mid, access, gran, base_hi; } __attribute__((packed));
 struct dt_ptr { uint16_t limit; uint32_t base; } __attribute__((packed));
-static struct gdt_entry gdt[3];
+static struct gdt_entry gdt[6];
+/* Intel 32-bit TSS, exactly 104 bytes. No I/O bitmap: every user port access denied. */
+struct tss32 { uint32_t prev, esp0, ss0, rest[22]; uint16_t trap, iomap; } __attribute__((packed));
+_Static_assert(sizeof(struct tss32) == 104, "TSS layout");
+static struct tss32 tss;
+extern uint8_t stack_top;
+void tss_set_stack(uint32_t esp) { tss.esp0 = esp; }
+
 static void gdt_set(int i, uint8_t access, uint8_t gran) {
     gdt[i].lim = 0xFFFF; gdt[i].base_lo = 0; gdt[i].base_mid = 0; gdt[i].base_hi = 0;
     gdt[i].access = access; gdt[i].gran = gran;
 }
 static void gdt_init(void) {
     gdt_set(1, 0x9A, 0xCF); gdt_set(2, 0x92, 0xCF);          /* flat ring-0 code and data */
+    gdt_set(3, 0xFA, 0xCF); gdt_set(4, 0xF2, 0xCF);
+    uint32_t b = (uint32_t)&tss;
+    gdt[5] = (struct gdt_entry){sizeof tss - 1, b & 0xffff, (b >> 16) & 0xff, 0x89, 0, b >> 24};
+    tss.ss0 = 0x10; tss.esp0 = (uint32_t)&stack_top; tss.iomap = sizeof tss;
     struct dt_ptr p = { sizeof gdt - 1, (uint32_t)gdt };
     __asm__ volatile("lgdt %0\n ljmp $0x08, $1f\n 1:\n"
                      "mov $0x10, %%ax\n mov %%ax, %%ds\n mov %%ax, %%es\n"
                      "mov %%ax, %%fs\n mov %%ax, %%gs\n mov %%ax, %%ss\n" :: "m"(p) : "eax", "memory");
+    __asm__ volatile("mov $0x28, %%ax; ltr %%ax" ::: "eax", "memory");
 }
 
 /* ---------- IDT, PIC, PIT, keyboard ---------- */
 struct idt_entry { uint16_t lo, sel; uint8_t zero, flags; uint16_t hi; } __attribute__((packed));
-struct regs { uint32_t edi, esi, ebp, esp_unused, ebx, edx, ecx, eax, int_no, err, eip, cs, eflags; };
+extern void isr128(void);
 extern uint32_t isr_stub_table[48];
 static struct idt_entry idt[256];
 
@@ -77,6 +91,8 @@ static void idt_init(void) {
         uint32_t a = isr_stub_table[i];
         idt[i].lo = a & 0xFFFF; idt[i].hi = a >> 16; idt[i].sel = 0x08; idt[i].zero = 0; idt[i].flags = 0x8E;
     }
+    uint32_t a = (uint32_t)isr128;
+    idt[128] = (struct idt_entry){a & 0xffff, 0x08, 0, 0xEE, a >> 16};
     struct dt_ptr p = { sizeof idt - 1, (uint32_t)idt };
     __asm__ volatile("lidt %0" :: "m"(p));
 }
@@ -114,6 +130,13 @@ static void panic_exit(const char *msg, struct regs *r, uint8_t code) {
 }
 
 uint32_t isr_handler(struct regs *r) {
+    if (r->int_no == 128) return syscall_dispatch(r);
+    if (r->int_no < 32 && (r->cs & 3) == 3) {
+        puts("user fault: task "); put_dec(task_current_id());
+        puts(" vector="); put_dec(r->int_no); puts(" err="); put_hex(r->err); puts("\n");
+        task_mark_dead();
+        return schedule((uint32_t)r);
+    }
     if (r->int_no == 14) {
         uint32_t cr2; __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
         puts("\n*** PAGE FAULT accessing "); put_hex(cr2);
@@ -244,7 +267,8 @@ static void run(char *line) {
              "malloc N | free ID     kmalloc N bytes / kfree handle ID\n"
              "heapcheck              verify heap block chain\n"
              "translate ADDR         virtual -> physical (decimal or 0x hex)\n"
-             "tasks                 list kernel threads and how often each was scheduled\n"
+             "user demo | spin | fault N   start ring-3 demo / loop / fault probe (1-7)\n"
+             "tasks                 list tasks and how often each was scheduled\n"
              "spawn blink | count N | churn N   start a demo thread\n"
              "kill ID                stop a thread\n"
              "crash                  touch an unmapped page (expect PAGE FAULT)\n"
@@ -284,6 +308,14 @@ static void run(char *line) {
         else { puts("usage: spawn blink | count N | churn N\n"); return; }
         if (id < 0) puts("could not create task (table full or out of memory)\n");
         else { puts("started task "); put_dec((uint32_t)id); puts("\n"); }
+    } else if (streq(c, "user") && argc > 1) {
+        uint32_t mode = 0;
+        if (streq(argv[1], "spin")) mode = 8;
+        else if (streq(argv[1], "fault") && argc > 2 && parse_num(argv[2], &mode) == 0 && mode >= 1 && mode <= 7) { }
+        else if (!streq(argv[1], "demo")) { puts("usage: user demo | spin | fault 1..7\n"); return; }
+        int id = task_create_user(mode);
+        if (id < 0) puts("could not create user task\n");
+        else { puts("started user task "); put_dec((uint32_t)id); puts("\n"); }
     } else if (streq(c, "kill") && argc > 1 && parse_num(argv[1], &v) == 0) {
         puts(task_kill(v) == 0 ? "killed\n" : "no such running task (task 1 and the shell cannot be killed)\n");
     } else if (streq(c, "crash")) { *(volatile uint32_t *)0xE0000000u = 1; }
@@ -304,9 +336,9 @@ void kernel_main(uint32_t magic, struct mb_info *mbi) {
     puts("[ok] Kernel heap at "); put_hex(HEAP_VIRT); puts("\n");
     kheap_set_lock(irq_save, irq_restore);                  /* heap becomes safe against preemption */
     tasking_init(); puts("[ok] Preemptive multitasking (round-robin, 100 Hz)\n");
+    puts("[ok] Ring 3 + TSS + int 0x80 (supervisor-only kernel pages)\n");
     __asm__ volatile("sti");
     puts("Type 'help' for commands.\n\n");
     char line[64];
     for (;;) { task_reap(); puts("StrataOS> "); readline(line, sizeof line); run(line); }
 }
-
