@@ -60,4 +60,24 @@ check(code == 35, "page fault exits with status 35 (got %s)" % code)
 
 out, code = run(["selftest", "halt"], mem=32)
 check("SELFTEST PASS" in out and code == 33, "selftest also passes with 32 MB RAM")
+out, code = run(["spawn blink", "spawn count 5", "tasks", "meminfo", "heapcheck", "uptime", "malloc 64", "free 0", "tasks", "kill 2", "kill 1", "kill 99", "tasks", "spawn churn 100", "selftest", "tasks", "halt"])
+print(out)
+check("[ok] Preemptive multitasking" in out, "phase 2 scheduler initialises")
+check("started task 2" in out and "started task 3" in out, "spawn starts tasks with ids 2 and 3")
+check("blink" in out and "main" in out and "ID  STATE" in out, "tasks command lists main and blink")
+check("heap OK" in out and "id 0 = 0xd0" in out, "shell stays responsive and heap works while workers run")
+check("killed" in out and "no such running task" in out, "kill works; killing main / unknown id refused")
+check(out.count("SELFTEST PASS") == 1 and "FAIL:" not in out, "selftest passes while a blink task is running")
+check(code == 33, "clean halt with tasks running (status %s)" % code)
+
+out, code = run(["spawn blink", "spawn count 1000", "selftest", "tasks", "halt"], timeout=60)
+print(out)
+tail = out.split("SELFTEST")[-1]
+check("SELFTEST PASS" in out and "FAIL:" not in out, "selftest passes with user tasks already running")
+check("blink" in tail and "count" in tail, "selftest leaves the user's own tasks running")
+
+out, code = run(["spawn blink", "crash"])
+check("PAGE FAULT accessing 0xe0000000" in out and code == 35, "page fault in the shell with tasks running is still reported (status %s)" % code)
+
 sys.exit(1 if fails else 0)
+
