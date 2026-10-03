@@ -1,4 +1,4 @@
-# StrataOS architecture (Phases 1-3)
+# StrataOS architecture (Phases 1-4)
 
 Boot: QEMU `-kernel` (Multiboot v1) -> `boot.s` sets a 16 KiB stack, calls `kernel_main(magic, mbi)`.
 
@@ -55,3 +55,17 @@ The PDF's illustrative code was not copied. A ring-3 C function in supervisor-on
 
 ### Phase 3 verification
 The QEMU harness has 42 assertions across 10 boots. It checks CPL3 and user DS, DF-safe entry, returned errno, supervisor/overflow/out-of-arena/unallocated pointers, oversize writes/allocations, zero-filled writable user allocation and second-allocation failure, sleep/yield/exit, preemption of a never-yielding user loop, and seven protection faults with expected vectors/error bits. Repeated exits at 32 MiB return frames/stacks to baseline (after warming the retained page table). Two user demos and a spinner run together; the existing 51-check kernel selftest runs while the user spinner is preempted. Task-table saturation is refused cleanly and all slots work again after kill/reap. Mac, CI and physical hardware remain unverified.
+
+
+
+## Phase 4: disk and filesystem (`ata.c`, `fs.c`)
+
+- **ATA driver.** Polled PIO on the primary bus, master drive, LBA28 (up to 128 GiB; disks are clamped to that). `ata_init` sets nIEN so the drive raises no interrupts, treats a floating bus (status 0xFF) or zero status as "no disk", runs IDENTIFY, rejects ATAPI/SATA signatures and drives without LBA, and records the sector count and model. Every wait is bounded, so a missing or stuck drive returns an error instead of hanging the kernel. Reads and writes return `ATA_ENODEV/ETIMEOUT/EIO/ERANGE`; writes end with a cache flush. Each transfer runs with interrupts off, so the scheduler cannot interleave two users of the controller.
+- **StrataFS layout.** LBA 0 superblock (magic `STRATAFS`, version, sizes), LBA 1-8 directory table of 64 entries x 64 bytes, data from LBA 9. An entry has a 31-character name, type (file/dir), parent index, size, and one contiguous extent. Directories are entries whose children point at them as parent; the root is implicit. Limits: 64 entries total, 64 KiB per file, names without spaces or `/`.
+- **Safety.** Mounting never writes. It validates the superblock, entry types, names, parent chains, extents inside the disk, duplicate names and overlapping extents; anything inconsistent is refused (`FS_ECORRUPT`) and left as is. A blank disk is "no filesystem" until the user runs `format yes`, which rewrites the directory table and then the superblock. Rewriting a file writes the new data to unused sectors first and updates the single directory sector last, so a failure before that leaves the old content intact. Failed directory writes restore the in-memory entry.
+- **Not provided.** No journal (a power cut during the final directory-sector write is not protected beyond the single-sector write), no fragmentation handling (a file needs a contiguous free run, so a fragmented disk can report "no space" with free sectors left), no timestamps or permissions, no caching, no concurrency control beyond the shell being the only caller, and no syscall access for user tasks.
+- **Shell.** `diskinfo`, `format yes`, `ls [path]`, `cat`, `write NAME TEXT`, `mkdir`, `rm` (file or empty directory), `cd`, `pwd`, `fsinfo`, plus `mkfile NAME N` and `verify NAME N` for pattern data. Paths may be absolute or relative and support `.` and `..`.
+- **Tests.** `fs.c` has no kernel dependencies, so `make test-host` runs it on a RAM disk under ASan/UBSan, including write-failure injection and byte-flip corruption of the directory table. `make test-qemu` boots with disposable images under `build/` (never `disk.img`): no disk, blank disk, format, persistence across reboots, corruption refusal with an unchanged image, disk full.
+
+### Phase 4 differences from the PDF snippets
+The PDF's code was not copied. Its driver loops forever on a missing disk or error, ignores error bits, never flushes, and its `ata_init` cannot tell whether a disk exists. Its filesystem formats the disk on the first sight of odd data (including any non-formatted disk), has no size or directory support beyond one 512-byte sector per file, assigns data sectors by directory index and updates the directory before the data, and uses `reboot`, which this kernel does not have.
