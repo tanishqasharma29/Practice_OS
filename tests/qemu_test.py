@@ -5,10 +5,11 @@ import os, subprocess, sys, time, select
 QEMU = os.environ.get("QEMU", "qemu-system-i386")
 KERNEL = os.path.join(os.path.dirname(__file__), "..", "build", "kernel.elf")
 
-def run(commands, mem=128, wait_exit=True, timeout=30):
+def run(commands, mem=128, wait_exit=True, timeout=30, disk=None):
+    drive = ["-drive", "file=%s,format=raw,if=ide,index=0" % disk] if disk else []
     p = subprocess.Popen(
         [QEMU, "-kernel", KERNEL, "-m", str(mem), "-display", "none", "-serial", "stdio",
-         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-no-reboot", "-nic", "none"],
+         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04", "-no-reboot", "-nic", "none"] + drive,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     out = b""
     def drain(t):
@@ -122,5 +123,74 @@ check(out.count("started user task") == 16 and out.count("could not create user 
       "user tasks respect fixed table limit; refused create does not leak a stack")
 check("USER DEMO PASS" in out and "heap OK" in out and code == 33,
       "all user slots reusable after kill/reap")
+
+# ---------- Phase 4: ATA disk and StrataFS (always on disposable images under build/) ----------
+import hashlib
+BUILD = os.path.join(os.path.dirname(__file__), "..", "build")
+def new_image(name, kib=4096):
+    path = os.path.join(BUILD, name)
+    with open(path, "wb") as f: f.truncate(kib * 1024)
+    return path
+def sha(path): return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+out, code = run(["diskinfo", "ls", "format yes", "write a hi", "halt"])
+print(out)
+check("No ATA disk attached" in out and "no ATA disk" in out and code == 33, "boots without a disk; disk commands refuse cleanly")
+
+img = new_image("blank.img")
+before = sha(img)
+out, code = run(["diskinfo", "ls", "write a hi", "mkdir d", "cat a", "format", "fsinfo", "halt"], disk=img)
+print(out)
+check("ATA disk: QEMU HARDDISK, 8192 sectors" in out and "sectors: 8192 (4 MiB)" in out, "ATA IDENTIFY finds the disk and its size")
+check("Disk has no StrataFS; nothing was written" in out and out.count("no filesystem mounted") >= 4, "blank disk is not auto-formatted; fs commands refuse")
+check("this erases the file table" in out and sha(img) == before and code == 33, "format needs the explicit 'yes'; blank image bytes unchanged")
+
+out, code = run(["format yes", "ls", "write hello.txt Hello_from_persistent_storage", "write note.txt two words here",
+                 "mkdir docs", "write docs/inner.txt inside docs", "ls", "ls docs", "cat hello.txt", "cat note.txt",
+                 "cd docs", "pwd", "cat inner.txt", "cd ..", "pwd", "cat docs", "cat nothing", "write bad/name x",
+                 "mkfile big 65536", "verify big 65536", "mkfile mid 1500", "verify mid 1500", "mkfile big 65537", "fsinfo", "halt"], disk=img)
+print(out)
+check("formatted StrataFS" in out and "Hello_from_persistent_storage" in out and "two words here" in out and "inside docs" in out,
+      "format, write, cat, subdirectory write")
+check("d docs/" in out and "- hello.txt  29 bytes" in out and "- inner.txt  11 bytes" in out, "ls shows files, sizes and directories")
+check("/docs\r\n" in out.replace("\n", "\\n") or "\n/docs" in out, "cd and pwd work")
+check("error: is a directory" in out and "error: no such file or directory" in out, "cat of directory / missing file report errors")
+check(out.count("verify OK") == 2 and "wrote 65536 bytes" in out, "64 KiB and 1500-byte files round-trip through the disk")
+check("error: file too large" in out and code == 33, "oversize file refused")
+
+out, code = run(["ls", "ls docs", "cat hello.txt", "cat docs/inner.txt", "verify big 65536", "verify mid 1500", "verify mid 1501",
+                 "write hello.txt replaced_text", "cat hello.txt", "rm docs", "rm docs/inner.txt", "rm docs", "rm big", "ls", "fsinfo", "halt"], disk=img)
+print(out)
+check("StrataFS mounted" in out and "Hello_from_persistent_storage" in out and "inside docs" in out, "files survive a power cycle (second boot)")
+check(out.count("verify OK") == 2 and "verify MISMATCH" in out, "multi-sector data persists byte-for-byte; wrong size detected")
+check("error: directory not empty" in out and "removed" in out, "rm refuses non-empty directory, removes file and empty directory")
+
+out, code = run(["ls", "cat hello.txt", "cat docs", "verify big 65536", "halt"], disk=img)
+print(out)
+check("replaced_text" in out and "no such file" in out, "replace and delete persisted across another boot")
+raw = open(img, "rb").read()
+check(raw[:8] == b"STRATAFS" and b"replaced_text" in raw, "image holds the on-disk superblock and file data")
+
+img2 = new_image("corrupt.img")
+out, code = run(["format yes", "write a hello", "halt"], disk=img2)
+data = bytearray(open(img2, "rb").read()); data[512 + 32] = 9           # invalid entry type in first directory slot
+open(img2, "wb").write(data)
+before = sha(img2)
+out, code = run(["ls", "write b x", "format", "halt"], disk=img2)
+print(out)
+check("StrataFS not mounted: filesystem metadata is inconsistent. Disk left untouched." in out and out.count("no filesystem mounted") >= 2, "corrupt filesystem is refused, not repaired")
+check(sha(img2) == before and code == 33, "corrupt image bytes unchanged by boot and refused commands")
+
+img3 = new_image("small.img", 256)
+out, code = run(["format yes", "mkfile a 65536", "mkfile b 65536", "mkfile c 65536", "mkfile d 65536", "fsinfo", "ls", "verify a 65536", "halt"], disk=img3)
+print(out)
+check("error: no space left" in out and "verify OK" in out, "disk-full refused and earlier files intact on a 256 KiB image")
+
+out, code = run(["selftest", "user demo", "uptime", "uptime", "uptime", "uptime", "halt"], disk=img)
+print(out)
+check("SELFTEST PASS" in out and "USER DEMO PASS" in out and code == 33, "kernel selftest and ring-3 demo still pass with a disk attached")
+for f in ("blank.img", "corrupt.img", "small.img"):
+    try: os.remove(os.path.join(BUILD, f))
+    except OSError: pass
 
 sys.exit(1 if fails else 0)
