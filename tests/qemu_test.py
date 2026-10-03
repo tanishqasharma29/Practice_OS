@@ -79,5 +79,48 @@ check("blink" in tail and "count" in tail, "selftest leaves the user's own tasks
 out, code = run(["spawn blink", "crash"])
 check("PAGE FAULT accessing 0xe0000000" in out and code == 35, "page fault in the shell with tasks running is still reported (status %s)" % code)
 
-sys.exit(1 if fails else 0)
+# Phase 3 uses real ring-3 instructions, not simulated dispatcher calls.
+out, code = run(["user demo", "user spin", "tasks", "uptime", "kill 3",
+                 "user fault 1", "user fault 2", "user fault 3", "user fault 4",
+                 "user fault 5", "user fault 6", "user fault 7", "heapcheck", "selftest", "halt"])
+print(out)
+check("[ok] Ring 3 + TSS + int 0x80" in out, "phase 3 initialises")
+check("USER DEMO PASS" in out and "USER DEMO FAIL" not in out and "UOK" in out,
+      "CPL/segments, DF entry, syscall results, pointer bounds, zeroed allocation, sleep/yield/exit")
+check("USER SPIN" in out and "3   ready" in out and "ticks:" in out and "killed" in out,
+      "never-yielding ring-3 task is preempted and killable")
+expected = [(4,14,5),(5,13,0),(6,13,0),(7,14,7),(8,13,0x102),(9,14,5),(10,14,6)]
+for task, vector, err in expected:
+    check("user fault: task %d vector=%d err=0x%08x" % (task,vector,err) in out,
+          "user fault probe %d contained (vector/error verified)" % (task-3))
+check("SELFTEST PASS" in out and "heap OK" in out and code == 33,
+      "shell/heap/scheduler survive user faults and exit cleanly")
 
+# Warm a user page table, then verify arena/stacks/allocation frames are all reaped.
+commands = ["user demo", "meminfo"] + ["user demo"] * 5 + ["meminfo", "tasks", "halt"]
+out, code = run(commands, mem=32)
+print(out)
+import re
+frames = re.findall(r"Physical: (\d+) free", out)
+used = re.findall(r"bytes mapped, (\d+) used", out)
+check(out.count("USER DEMO PASS") == 6 and code == 33, "repeated ring-3 runs with 32 MB RAM")
+check(len(frames) == 2 and frames[0] == frames[1] and len(used) == 2 and used[0] == used[1],
+      "user frame and kernel-stack reclamation after exit")
+check(out.split("ID  STATE")[-1].count("user") == 0, "completed user tasks reaped")
+
+out, code = run(["user demo\nuser demo\nuser spin", "selftest", "tasks", "kill 4", "heapcheck", "halt"])
+print(out)
+check(out.count("USER DEMO PASS") == 2 and "USER DEMO FAIL" not in out,
+      "two simultaneous user arenas and independent syscall stacks")
+check("SELFTEST PASS" in out and "4   ready" in out and "heap OK" in out and code == 33,
+      "kernel selftest alongside preempted user spin")
+
+out, code = run(["\n".join(["user spin"] * 16), "tasks",
+                 "\n".join("kill %d" % i for i in range(2,17)), "tasks", "user demo", "heapcheck", "halt"])
+print(out)
+check(out.count("started user task") == 16 and out.count("could not create user task") == 1,
+      "user tasks respect fixed table limit; refused create does not leak a stack")
+check("USER DEMO PASS" in out and "heap OK" in out and code == 33,
+      "all user slots reusable after kill/reap")
+
+sys.exit(1 if fails else 0)
