@@ -13,6 +13,7 @@
 .align 16
 stack_bottom:
 .skip 16384
+.global stack_top
 stack_top:
 
 .section .text
@@ -75,13 +76,29 @@ ISR_NOERR 31
 ISR_NOERR \n
 .endr
 
+ .global isr128
+ISR_NOERR 128
+
 isr_common:
+    push %ds
+    push %es
+    push %fs
+    push %gs
     pusha
+    mov $0x10, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    mov %ax, %gs
     cld
     push %esp
     call isr_handler       /* returns the stack pointer to resume (changes on a task switch) */
     mov %eax, %esp
     popa
+    pop %gs
+    pop %fs
+    pop %es
+    pop %ds
     add $8, %esp
     iret
 
@@ -92,4 +109,3 @@ isr_stub_table:
 .long isr\n
 .endr
 .section .note.GNU-stack,"",@progbits
-
