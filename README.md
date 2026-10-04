@@ -154,4 +154,4 @@ No further phases are currently planned for this repository.
 
 ## 📄 License
 
-*No license file is included yet.*
+This project is licensed under the [MIT License](LICENSE).
