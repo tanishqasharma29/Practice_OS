@@ -31,5 +31,5 @@ StrataOS is a small educational 32-bit x86 kernel in C with a little assembly. I
 ## Known limits
 - User tasks share one page directory, so they are not isolated from each other.
 - Ring-3 support is a built-in demo only: no ELF or external program loader, no per-process CR3, no user `free`, no guard pages, no full security isolation.
-- No disk driver or filesystem yet (Phase 4 is planned, not published).
+- At the Phases 1-3 milestone, there was no disk driver or filesystem. Phase 4 is now published; see [Phase 4 documentation](PHASE_4.md).
 - No license file is included.
