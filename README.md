@@ -61,6 +61,15 @@ Initially conceptualized as *miniOS*, StrataOS currently implements up to **Phas
 
 ---
 
+## Phase documentation
+
+- [Phase 1: memory management](docs/PHASE_1.md)
+- [Phase 2: preemptive multitasking](docs/PHASE_2.md)
+- [Phase 3: user space and system calls](docs/PHASE_3.md)
+- [Phase 4: disk storage and StrataFS](docs/PHASE_4.md)
+
+---
+
 ## 📸 Screenshots
 
 | Boot Sequence | Phase 2 Execution |
